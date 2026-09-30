@@ -1,0 +1,36 @@
+{
+  "_source": "India Meteorological Department (IMD) / Regional Specialized Meteorological Centre (RSMC) New Delhi - Tropical Cyclone Landfall Climatology (https://rsmcnewdelhi.imd.gov.in/landfall.php)",
+  "_climatology_summary": "Over 60% of Bay of Bengal tropical cyclones make landfall on India's East Coast, with two distinct seasons: pre-monsoon (April-June) and post-monsoon (October-December), with October-December being the primary and most active season. Climatological peak landfall timing: Odisha & West Bengal coasts peak in October; Andhra Pradesh coast peaks in November; Tamil Nadu coast peaks in December.",
+  "Odisha": {
+    "state": "Odisha",
+    "peak_month": 10,
+    "peak_month_name": "October",
+    "season_months": [4, 5, 6, 10, 11, 12],
+    "peak_risk_label": "High",
+    "climatology_note": "Odisha coast landfall frequency peaks in October during the post-monsoon cyclone season (Oct-Dec) with secondary pre-monsoon activity (Apr-Jun)."
+  },
+  "West Bengal": {
+    "state": "West Bengal",
+    "peak_month": 10,
+    "peak_month_name": "October",
+    "season_months": [4, 5, 6, 10, 11, 12],
+    "peak_risk_label": "High",
+    "climatology_note": "West Bengal / Sundarbans coast landfall frequency peaks in October during post-monsoon season."
+  },
+  "Andhra Pradesh": {
+    "state": "Andhra Pradesh",
+    "peak_month": 11,
+    "peak_month_name": "November",
+    "season_months": [4, 5, 6, 10, 11, 12],
+    "peak_risk_label": "High",
+    "climatology_note": "Andhra Pradesh coast landfall frequency peaks in November during the post-monsoon cyclone season."
+  },
+  "Tamil Nadu": {
+    "state": "Tamil Nadu",
+    "peak_month": 12,
+    "peak_month_name": "December",
+    "season_months": [4, 5, 6, 10, 11, 12],
+    "peak_risk_label": "High",
+    "climatology_note": "Tamil Nadu coast landfall frequency peaks in December during the late post-monsoon / northeast monsoon season."
+  }
+}

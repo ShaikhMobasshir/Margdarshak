@@ -1,0 +1,6 @@
+{
+  "Handysize":  {"dwt_min": 15000,  "dwt_max": 39999,  "loa_m": 190, "beam_m": 30, "draft_m": 10.0},
+  "Supramax":   {"dwt_min": 40000,  "dwt_max": 64999,  "loa_m": 200, "beam_m": 32, "draft_m": 12.5},
+  "Panamax":    {"dwt_min": 65000,  "dwt_max": 99999,  "loa_m": 240, "beam_m": 32.31, "draft_m": 14.0},
+  "Capesize":   {"dwt_min": 90000,  "dwt_max": 200000, "loa_m": 290, "beam_m": 45, "draft_m": 18.0}
+}
