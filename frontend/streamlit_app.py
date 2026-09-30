@@ -15,15 +15,27 @@ Consolidated Design System:
 """
 
 import os
+import sys
 import json
-import requests
 import pandas as pd
 import altair as alt
 import pydeck as pdk
 import streamlit as st
 
-# Backend API URL
-API_BASE = os.environ.get("API_BASE_URL", "http://127.0.0.1:8000")
+# Add project root to path so backend modules can be imported directly
+_FRONTEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_FRONTEND_DIR)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from backend.forecasting.forecast import get_forecast
+from backend.vessel_recommender.recommend import recommend_vessel, load_reference_data, load_routes_data
+from backend.rules.risk_flags import compute_risk_flags
+from backend.rules.seasonal_risk import compute_seasonal_risk
+from backend.rules.fx_risk import compute_fx_risk
+from backend.rules.composite_risk import compute_composite_risk, evaluate_idle_time_risk
+from backend.rules.idle_time import check_idle_time_risk
+from backend.rules.market_timing import find_optimal_entry_window
 
 # Page configuration - strictly zero emoji
 st.set_page_config(
@@ -635,18 +647,8 @@ def make_sparkline_svg(values, width=120, height=24, color="#0D9488"):
 # Reference Data Loaders
 # ---------------------------------------------------------------------------
 def load_origin_ports():
-    """Load overseas origin port names and metadata."""
-    try:
-        r = requests.get(f"{API_BASE}/api/origin-ports", timeout=5)
-        if r.status_code == 200:
-            return r.json()
-    except requests.exceptions.ConnectionError:
-        pass
-
-    ports_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..", "data", "reference", "origin_ports.json"
-    )
+    """Load overseas origin port names and metadata directly from JSON."""
+    ports_path = os.path.join(_PROJECT_ROOT, "data", "reference", "origin_ports.json")
     if os.path.exists(ports_path):
         with open(ports_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -654,18 +656,8 @@ def load_origin_ports():
 
 
 def load_dest_ports():
-    """Load Indian East Coast destination port names and metadata."""
-    try:
-        r = requests.get(f"{API_BASE}/api/ports", timeout=5)
-        if r.status_code == 200:
-            return r.json()
-    except requests.exceptions.ConnectionError:
-        pass
-
-    ports_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..", "data", "reference", "ports.json"
-    )
+    """Load Indian East Coast destination port names and metadata directly from JSON."""
+    ports_path = os.path.join(_PROJECT_ROOT, "data", "reference", "ports.json")
     if os.path.exists(ports_path):
         with open(ports_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -841,6 +833,178 @@ def get_maritime_route_data(origin_name, dest_name, origin_lat, origin_lon, dest
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Decision Engine (Direct In-Process Orchestration)
+# Replaces HTTP calls to /api/recommend — runs all backend logic directly
+# ---------------------------------------------------------------------------
+def _run_decision_engine(cargo_qty, origin, destination, horizon_days, origin_ports, dest_ports):
+    """
+    Orchestrates: forecast -> vessel recommendation -> risk flags -> idle-time flags.
+    This is the same logic as backend/app.py /api/recommend, called directly.
+    """
+    # Step 1: Get composite BDI forecast
+    forecast_data = get_forecast("bdi", horizon_days)
+
+    # Step 2: Build per-vessel-class rate lookup
+    sub_index_map = {
+        "capesize": "bci",
+        "panamax": "bpi",
+        "supramax": "bsi",
+        "handysize": "bhsi",
+    }
+
+    avg_bdi = sum(p["yhat"] for p in forecast_data) / len(forecast_data)
+    bdi_rate = avg_bdi / 100
+
+    rate_lookup = {"bdi": round(bdi_rate, 2)}
+    sub_index_rates = {}
+
+    for vessel_class, index_name in sub_index_map.items():
+        try:
+            sub_forecast = get_forecast(index_name, horizon_days)
+            avg_sub = sum(p["yhat"] for p in sub_forecast) / len(sub_forecast)
+            rate = avg_sub / 100
+            rate_lookup[vessel_class] = round(rate, 2)
+            sub_index_rates[index_name.upper()] = round(avg_sub, 2)
+        except FileNotFoundError:
+            rate_lookup[vessel_class] = bdi_rate
+            sub_index_rates[index_name.upper()] = None
+
+    # Step 3: Vessel recommendation
+    vessel_recommendations = recommend_vessel(cargo_qty, origin, destination, rate_lookup)
+
+    # Step 4: Idle-time flags
+    idle_time_flags = []
+    top_spec = None
+    feasible_vessels = [v for v in vessel_recommendations if v["feasible"]]
+
+    if feasible_vessels:
+        top_vessel = feasible_vessels[0]
+        specs_path = os.path.join(_PROJECT_ROOT, "data", "reference", "vessel_specs.json")
+        with open(specs_path) as f:
+            all_specs = json.load(f)
+        top_spec = all_specs.get(top_vessel["vessel_class"])
+        if top_spec:
+            idle_time_flags = check_idle_time_risk(top_spec, cargo_qty, forecast_data)
+
+    # Step 5: Multi-criteria risk assessment
+    market_risk = compute_risk_flags(forecast_data)
+    forecast_start_date = forecast_data[0]["ds"] if forecast_data else None
+    seasonal_risk = compute_seasonal_risk(destination, forecast_start_date, horizon_days)
+    fx_risk = compute_fx_risk()
+    idle_risk = evaluate_idle_time_risk(idle_time_flags, cargo_qty, top_spec)
+    composite_risk = compute_composite_risk(market_risk, seasonal_risk, fx_risk, idle_risk)
+
+    risk_analysis = {
+        "overall_verdict": composite_risk["composite_tier"],
+        "market_verdict": market_risk["overall_verdict"],
+        "pct_days_flagged": market_risk["pct_days_flagged"],
+        "peak_volatility": market_risk["peak_volatility"],
+        "first_moderate_date": market_risk["first_moderate_date"],
+        "volatility_trend": market_risk["volatility_trend"],
+        "volatility_trend_slope": market_risk["volatility_trend_slope"],
+        "recommendation": composite_risk["recommendation"],
+        "market_recommendation": market_risk["recommendation"],
+        "daily_volatility": market_risk["daily_volatility"],
+        "daily_flags": market_risk["daily_flags"],
+        "composite_score": composite_risk["composite_score"],
+        "composite_tier": composite_risk["composite_tier"],
+        "headline_verdict": composite_risk["headline_verdict"],
+        "nominal_weights": composite_risk["nominal_weights"],
+        "effective_weights": composite_risk["effective_weights"],
+        "weight_reallocated": composite_risk["weight_reallocated"],
+        "disclosure": composite_risk["disclosure"],
+        "criteria": composite_risk["criteria"],
+        "market_risk": market_risk,
+        "seasonal_risk": seasonal_risk,
+        "fx_risk": fx_risk,
+        "idle_risk": idle_risk,
+    }
+
+    first_vessel = vessel_recommendations[0] if vessel_recommendations else {}
+
+    # Build metadata
+    metadata = {
+        "data_source": "real",
+        "forecast_engine": "Prophet",
+        "horizon_days": horizon_days,
+        "avg_bdi_forecast": round(avg_bdi, 2),
+        "rate_lookup": rate_lookup,
+        "sub_index_averages": sub_index_rates,
+        "route_type": "international",
+        "origin_country": origin_ports[origin].get("country", "Unknown"),
+        "route_distance_nm": first_vessel.get("distance_nm"),
+        "route_adjusted_distance_nm": first_vessel.get("adjusted_distance_nm"),
+        "route_adjustment_factor": first_vessel.get("adjustment_factor", 1.10),
+        "route_speed_knots": first_vessel.get("speed_knots", 13.0),
+        "route_sea_days": first_vessel.get("sea_days"),
+        "berth_days": first_vessel.get("berth_days"),
+        "congestion_days": first_vessel.get("congestion_days"),
+        "total_voyage_days": first_vessel.get("total_voyage_days"),
+        "destination_max_vessel_dwt": dest_ports[destination].get("max_vessel_dwt"),
+        "destination_dwt_verified": dest_ports[destination].get("dwt_verified", True),
+        "destination_draft_verified": dest_ports[destination].get("draft_verified", True),
+        "destination_dwt_source": dest_ports[destination].get("dwt_source"),
+        "disclosure": (
+            "Max vessel DWT capacity is officially verified for all 6 Indian destination ports. "
+            "Beam limits and cargo handling rates are illustrative estimates, not sourced from official port authority data "
+            "(this level of detail typically requires port pilot handbooks not publicly accessible). Draft/LOA figures for verified "
+            "ports and route distances are independently sourced/calculated and carry higher confidence than beam/handling-rate figures."
+        ),
+        "congestion_disclosure": "Port congestion estimates (days) are demonstration figures for modeling turnaround time, not measured real-time telemetry."
+    }
+
+    # Port verification warnings
+    port_warnings = []
+    if not origin_ports[origin].get("verified", True):
+        port_warnings.append(
+            f"Port draft/LOA data for {origin} is illustrative and pending verification. "
+            f"({origin_ports[origin].get('notes', '')})"
+        )
+
+    if destination == "Paradip":
+        port_warnings.append(
+            "Paradip Port capacity disclosure: Max vessel size ~155,000 DWT Capesize is officially verified "
+            "(Paradip Port infrastructure page); berth draft is ~16-16.5m. Disclosed operational tension: "
+            "Official max_vessel_dwt (155,000 DWT, Capesize-range) implies deeper effective access than cited berth "
+            "draft alone would suggest (Capesize typically requires ~18m draft), reflecting additional channel/anchorage "
+            "arrangements not captured by a single berth-draft figure."
+        )
+    elif destination == "Gopalpur":
+        port_warnings.append(
+            "Gopalpur Port capacity disclosure: Max vessel size 200,000 DWT Capesize ceiling is officially verified "
+            "(Gopalpur Ports berthing policy 2024). Note: The draft figure (13.5m placeholder) is provisional and "
+            "flagged as needing further hydrographic precision given the verified 200,000 DWT capability."
+        )
+    elif destination == "Haldia":
+        port_warnings.append(
+            "Haldia Port capacity disclosure: Max vessel size ~75,000 DWT dry-bulk berth ceiling is officially verified "
+            "(Shipping Ministry / HDC administrative report). Note: Navigable river draft (9.0m placeholder) reflects "
+            "Hooghly river constraints and is flagged as needing further precision rather than guessing an unverified draft."
+        )
+    elif not dest_ports[destination].get("verified", True):
+        port_warnings.append(
+            f"Port draft/LOA data for {destination} is illustrative and pending verification."
+        )
+
+    if port_warnings:
+        metadata["port_warnings"] = port_warnings
+
+    # Step 6: Optimal market entry timing
+    market_timing = find_optimal_entry_window(forecast_data, window_days=7)
+
+    return {
+        "forecast": forecast_data,
+        "vessel_recommendations": vessel_recommendations,
+        "risk_analysis": risk_analysis,
+        "risk_flags": risk_analysis["daily_flags"],
+        "idle_time_flags": idle_time_flags,
+        "market_timing": market_timing,
+        "metadata": metadata,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main Application
 # ---------------------------------------------------------------------------
 def main():
@@ -864,9 +1028,8 @@ def main():
     if not origin_ports or not dest_ports:
         st.markdown("""
         <div class="custom-callout severe">
-            <strong>SYSTEM ALERT: Backend Service Offline</strong><br>
-            Could not connect to the decision engine at <code>http://127.0.0.1:8000</code>.<br>
-            Please start the backend API: <code>python -m uvicorn backend.app:app --port 8000</code>
+            <strong>SYSTEM ALERT: Reference Data Missing</strong><br>
+            Could not load port reference data from <code>data/reference/</code>.
         </div>
         """, unsafe_allow_html=True)
         return
@@ -929,37 +1092,16 @@ def main():
     if run_query or "recommendation_data" not in st.session_state:
         with st.spinner("Computing freight forecasts, port feasibility evaluations, and volatility risk profiles..."):
             try:
-                r = requests.get(
-                    f"{API_BASE}/api/recommend",
-                    params={
-                        "cargo_qty": cargo_qty,
-                        "origin": origin,
-                        "destination": destination,
-                        "horizon_days": horizon_days,
-                    },
-                    timeout=60,
-                )
-
-                if r.status_code == 200:
-                    data = r.json()
-                    st.session_state["recommendation_data"] = data
-                    st.session_state["active_params"] = {
-                        "cargo_qty": cargo_qty,
-                        "origin": origin,
-                        "destination": destination,
-                        "horizon_days": horizon_days
-                    }
-                else:
-                    detail = r.json().get("detail", r.text) if r.headers.get("content-type") == "application/json" else r.text
-                    st.error(f"API Error ({r.status_code}): {detail}")
-                    return
-
-            except requests.exceptions.ConnectionError:
-                st.markdown("""
-                <div class="custom-callout severe">
-                    <strong>CONNECTION FAILURE:</strong> Cannot reach backend decision engine at <code>http://127.0.0.1:8000</code>.
-                </div>
-                """, unsafe_allow_html=True)
+                data = _run_decision_engine(cargo_qty, origin, destination, horizon_days, origin_ports, dest_ports)
+                st.session_state["recommendation_data"] = data
+                st.session_state["active_params"] = {
+                    "cargo_qty": cargo_qty,
+                    "origin": origin,
+                    "destination": destination,
+                    "horizon_days": horizon_days
+                }
+            except FileNotFoundError as e:
+                st.error(f"Model not found: {e}. Please run train_model.py first.")
                 return
             except Exception as e:
                 st.error(f"Execution Error: {e}")
